@@ -94,48 +94,56 @@ export async function searchByPhone(phone) {
 }
 
 /**
- * Create a new contact + lead in AmoCRM and link them together.
+ * Create a new contact + lead in AmoCRM in two requests.
+ * Contact is embedded directly in the lead creation body — no separate linking call needed.
  * Used when searchByPhone() returns null.
  *
  * @param {string} phone
  * @returns {Promise<{contactId: number, leadId: number, entityType: 'leads'}>}
  */
 export async function createContactWithLead(phone) {
-  // 1. Create contact
-  const { data: contactData } = await amoClient.post('/contacts', [
-    {
-      name: `Звонок ${phone}`,
-      custom_fields_values: [
-        {
-          field_id: 264,
-          values: [{ value: phone, enum_code: 'WORK' }],
+  // 1. Create contact with phone field (field_code instead of field_id)
+  let contactId;
+  try {
+    const { data: contactData } = await amoClient.post('/contacts', [
+      {
+        name: `Звонок ${phone}`,
+        custom_fields_values: [
+          {
+            field_code: 'PHONE',
+            values: [{ value: phone, enum_code: 'WORK' }],
+          },
+        ],
+      },
+    ]);
+
+    contactId = contactData._embedded.contacts[0].id;
+    console.log(`[AMO] Создан контакт #${contactId}`);
+  } catch (err) {
+    console.error('[AMO] 400 error body:', JSON.stringify(err.response?.data));
+    console.error('[AMO] 400 request body:', JSON.stringify(err.config?.data));
+    throw err;
+  }
+
+  // 2. Create lead with contact embedded — AmoCRM links them automatically
+  let leadId;
+  try {
+    const { data: leadData } = await amoClient.post('/leads', [
+      {
+        name: `Входящий звонок ${phone}`,
+        _embedded: {
+          contacts: [{ id: contactId }],
         },
-      ],
-    },
-  ]);
+      },
+    ]);
 
-  const contactId = contactData._embedded.contacts[0].id;
-  console.log(`[AMO] Создан контакт #${contactId}`);
-
-  // 2. Create lead
-  const { data: leadData } = await amoClient.post('/leads', [
-    {
-      name: `Входящий звонок ${phone}`,
-    },
-  ]);
-
-  const leadId = leadData._embedded.leads[0].id;
-  console.log(`[AMO] Создана сделка #${leadId}`);
-
-  // 3. Link contact to lead
-  await amoClient.post(`/leads/${leadId}/links`, [
-    {
-      to_entity_id: contactId,
-      to_entity_type: 'contacts',
-    },
-  ]);
-
-  console.log(`[AMO] Контакт #${contactId} привязан к сделке #${leadId}`);
+    leadId = leadData._embedded.leads[0].id;
+    console.log(`[AMO] Создана сделка #${leadId} с привязанным контактом #${contactId}`);
+  } catch (err) {
+    console.error('[AMO] 400 error body:', JSON.stringify(err.response?.data));
+    console.error('[AMO] 400 request body:', JSON.stringify(err.config?.data));
+    throw err;
+  }
 
   return { contactId, leadId, entityType: 'leads' };
 }
