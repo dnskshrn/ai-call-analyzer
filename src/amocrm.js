@@ -166,3 +166,73 @@ export async function postNote(entityType, entityId, noteText) {
     },
   ]);
 }
+
+/**
+ * Create a follow-up task on a lead in AmoCRM.
+ *
+ * @param {number} leadId
+ * @param {number} responsibleUserId
+ * @param {string} text
+ * @param {number} deadlineDays  Number of days from now until the task deadline.
+ * @returns {Promise<void>}
+ */
+export async function createTask(leadId, responsibleUserId, text, deadlineDays) {
+  await amoClient.post('/tasks', [
+    {
+      task_type_id: 1,
+      text,
+      complete_till: Math.floor(Date.now() / 1000) + deadlineDays * 86400,
+      entity_type: 'leads',
+      entity_id: leadId,
+      responsible_user_id: responsibleUserId,
+    },
+  ]);
+}
+
+/**
+ * Replace tags on a lead (additive — AmoCRM merges by tag name).
+ *
+ * @param {number} leadId
+ * @param {string[]} tags
+ * @returns {Promise<void>}
+ */
+export async function updateLeadTags(leadId, tags) {
+  await amoClient.patch(`/leads/${leadId}`, {
+    _embedded: {
+      tags: tags.map((name) => ({ name })),
+    },
+  });
+}
+
+/**
+ * Update a contact's display name.
+ *
+ * @param {number} contactId
+ * @param {string} name
+ * @returns {Promise<void>}
+ */
+export async function updateContactName(contactId, name) {
+  await amoClient.patch('/contacts', [{ id: contactId, name }]);
+}
+
+/**
+ * Update a lead's name.
+ *
+ * @param {number} leadId
+ * @param {string} name
+ * @returns {Promise<void>}
+ */
+export async function updateLeadName(leadId, name) {
+  await amoClient.patch('/leads', [{ id: leadId, name }]);
+}
+
+/**
+ * Fetch the first user in the account and return their ID.
+ * Used as a default responsible_user_id for tasks.
+ *
+ * @returns {Promise<number>}
+ */
+export async function getResponsibleUser() {
+  const { data } = await amoClient.get('/users', { params: { limit: 1 } });
+  return data._embedded.users[0].id;
+}

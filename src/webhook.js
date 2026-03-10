@@ -3,14 +3,39 @@ import path from 'path';
 import { pipeline } from 'stream/promises';
 import axios from 'axios';
 import OpenAI from 'openai';
-import { searchByPhone, createContactWithLead, postNote } from './amocrm.js';
+import {
+  searchByPhone,
+  createContactWithLead,
+  postNote,
+  createTask,
+  updateLeadTags,
+  updateContactName,
+  updateLeadName,
+  getResponsibleUser,
+} from './amocrm.js';
+import { analyzeTranscript } from './analyze.js';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const SUMMARY_SYSTEM_PROMPT =
-  'Ты помощник менеджера по продажам. Проанализируй транскрипцию звонка и напиши краткое резюме для CRM на русском языке. Включи: 1) О чём говорили, 2) Что пообещали клиенту, 3) Следующий шаг. Будь конкретным и кратким.';
-
 const CALL_TYPE_LABEL = { in: 'Входящий', out: 'Исходящий' };
+
+/** Cached responsible user ID — fetched once at first use. */
+let cachedResponsibleUserId = null;
+
+/**
+ * @returns {Promise<number>}
+ */
+async function getResponsibleUserId() {
+  if (cachedResponsibleUserId) return cachedResponsibleUserId;
+  try {
+    cachedResponsibleUserId = await getResponsibleUser();
+    console.log(`[AMO] Ответственный пользователь по умолчанию: #${cachedResponsibleUserId}`);
+  } catch (err) {
+    console.error('[AMO] Не удалось получить пользователя:', err.message);
+    cachedResponsibleUserId = null;
+  }
+  return cachedResponsibleUserId;
+}
 
 /**
  * Format seconds into a human-readable "Xм Yс" string.
@@ -25,7 +50,7 @@ function formatDuration(seconds) {
 }
 
 /**
- * Build the final CRM note text from metadata + AI summary.
+ * Build the final CRM note header + AI summary block.
  *
  * @param {{ type: string, duration: number, phone: string, callid: string }} meta
  * @param {string} summary
@@ -39,7 +64,6 @@ function buildNoteText(meta, summary) {
     `📞 ${typeLabel} звонок | ${durationStr} | ${meta.phone}`,
     `🆔 Call ID: ${meta.callid}`,
     '',
-    '📝 Резюме звонка:',
     summary,
   ].join('\n');
 }
@@ -48,16 +72,14 @@ function buildNoteText(meta, summary) {
  * Download MP3 from url, stream it to a temp file, return the file path.
  *
  * @param {string} url
- * @param {string} callid  Used to generate a unique filename.
- * @returns {Promise<string>} Absolute path to the temp file.
+ * @param {string} callid
+ * @returns {Promise<string>}
  */
 async function downloadMp3(url, callid) {
   const tmpPath = path.join('/tmp', `call_${callid}_${Date.now()}.mp3`);
   const writer = fs.createWriteStream(tmpPath);
-
   const response = await axios.get(url, { responseType: 'stream', timeout: 60_000 });
   await pipeline(response.data, writer);
-
   return tmpPath;
 }
 
@@ -73,52 +95,7 @@ async function transcribeAudio(filePath) {
     model: 'whisper-1',
     language: 'ru',
   });
-
   return transcription.text;
-}
-
-/**
- * Summarise a transcript using GPT-4o-mini.
- *
- * @param {string} transcript
- * @returns {Promise<string>}
- */
-async function summariseTranscript(transcript) {
-  const completion = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
-    messages: [
-      { role: 'system', content: SUMMARY_SYSTEM_PROMPT },
-      { role: 'user', content: transcript },
-    ],
-    temperature: 0.3,
-    max_tokens: 500,
-  });
-
-  return completion.choices[0].message.content.trim();
-}
-
-/**
- * Post a note to AmoCRM.
- * Tries lead first, falls back to contact, logs warning if nothing found.
- *
- * @param {{ contactId: number, leadId: number|null }|null} amoResult
- * @param {string} noteText
- * @param {string} phone
- * @returns {Promise<void>}
- */
-async function postNoteToAmo(amoResult, noteText, phone) {
-  if (!amoResult) {
-    console.warn(`[AMO] Нет данных сущности для ${phone} — заметка не опубликована.`);
-    return;
-  }
-
-  if (amoResult.leadId) {
-    await postNote('leads', amoResult.leadId, noteText);
-    console.log(`[AMO] Заметка добавлена в сделку #${amoResult.leadId}`);
-  } else {
-    await postNote('contacts', amoResult.contactId, noteText);
-    console.log(`[AMO] Заметка добавлена в контакт #${amoResult.contactId}`);
-  }
 }
 
 /**
@@ -128,7 +105,7 @@ async function postNoteToAmo(amoResult, noteText, phone) {
  * @param {import('express').Response} res
  */
 export async function handleWebhook(req, res) {
-  const { cmd, type, status, phone, link, callid, duration, start, crm_token } = req.body;
+  const { type, status, phone, link, callid, duration, crm_token } = req.body;
 
   // ── Step 1: Validate CRM token ───────────────────────────────────────────
   if (crm_token !== process.env.PBX_CRM_TOKEN) {
@@ -141,47 +118,44 @@ export async function handleWebhook(req, res) {
   // ── Step 2: Skip short / missed / unrecorded calls ────────────────────────
   const durationNum = Number(duration);
   if (status !== 'Success' || durationNum < 10 || !link) {
-    console.log(`[WEBHOOK] Пропуск звонка callid=${callid}: status=${status}, duration=${durationNum}, link=${link}`);
+    console.log(`[WEBHOOK] Пропуск callid=${callid}: status=${status}, duration=${durationNum}, link=${link}`);
     return res.status(200).json({ ok: true });
   }
 
-  // Always answer 200 to PBX — errors are handled internally
+  // Respond immediately so PBX doesn't retry
   res.status(200).json({ ok: true });
 
   const meta = { type, duration: durationNum, phone, callid };
   let tmpPath = null;
 
   try {
-    // ── Step 3: Download MP3 ────────────────────────────────────────────────
+    // ── Step 3: Download MP3 ─────────────────────────────────────────────────
     console.log(`[WEBHOOK] Скачиваю запись: ${link}`);
     tmpPath = await downloadMp3(link, callid);
     console.log(`[WEBHOOK] Файл сохранён: ${tmpPath}`);
 
-    let summary;
-
+    // ── Step 4: Transcribe ───────────────────────────────────────────────────
+    let transcript = '';
     try {
-      // ── Step 4: Transcribe ────────────────────────────────────────────────
-      console.log(`[WEBHOOK] Транскрибирую...`);
-      const transcript = await transcribeAudio(tmpPath);
+      console.log('[WEBHOOK] Транскрибирую...');
+      transcript = await transcribeAudio(tmpPath);
       console.log(`[WEBHOOK] Транскрипция (${transcript.length} символов)`);
-
-      // ── Step 5: Summarise ─────────────────────────────────────────────────
-      console.log(`[WEBHOOK] Генерирую резюме...`);
-      summary = await summariseTranscript(transcript);
-      console.log(`[WEBHOOK] Резюме готово`);
-    } catch (aiErr) {
-      console.error(`[WEBHOOK] Ошибка AI (callid=${callid}):`, aiErr.message);
-      summary = 'Транскрипция недоступна (ошибка обработки).';
+    } catch (whisperErr) {
+      console.error(`[WEBHOOK] Ошибка Whisper (callid=${callid}):`, whisperErr.message);
     }
 
-    const noteText = buildNoteText(meta, summary);
+    // ── Step 5: Analyse with GPT ─────────────────────────────────────────────
+    console.log('[WEBHOOK] Анализирую транскрипцию...');
+    const analysis = await analyzeTranscript(transcript);
+    console.log(`[WEBHOOK] Анализ готов. client_name=${analysis.client_name} tags=${analysis.tags.join(', ')} has_next_step=${analysis.has_next_step}`);
 
-    // ── Step 6: Search AmoCRM, create if not found ──────────────────────────
+    const noteText = buildNoteText(meta, analysis.summary);
+
+    // ── Step 6: Search AmoCRM, create if not found ───────────────────────────
     console.log(`[AMO] Ищу контакт по номеру: ${phone}`);
     let amoResult = null;
     try {
       amoResult = await searchByPhone(phone);
-
       if (!amoResult) {
         console.log(`[AMO] Контакт не найден, создаю новый контакт и сделку для ${phone}`);
         amoResult = await createContactWithLead(phone);
@@ -190,16 +164,70 @@ export async function handleWebhook(req, res) {
       console.error(`[AMO] Ошибка поиска/создания (callid=${callid}):`, amoErr.message);
     }
 
-    // ── Steps 7 & 8: Post note ───────────────────────────────────────────────
+    if (!amoResult) {
+      console.warn(`[AMO] Нет данных сущности для ${phone} — пропускаем обогащение.`);
+      return;
+    }
+
+    const { contactId, leadId } = amoResult;
+
+    // ── Step 7: Post note ────────────────────────────────────────────────────
     try {
-      await postNoteToAmo(amoResult, noteText, phone);
+      const entityType = leadId ? 'leads' : 'contacts';
+      const entityId = leadId ?? contactId;
+      await postNote(entityType, entityId, noteText);
+      console.log(`[AMO] Заметка добавлена в ${entityType} #${entityId}`);
     } catch (noteErr) {
       console.error(`[AMO] Ошибка публикации заметки (callid=${callid}):`, noteErr.message);
+    }
+
+    // ── Step 8: Enrich contact name ──────────────────────────────────────────
+    if (analysis.client_name && contactId) {
+      try {
+        await updateContactName(contactId, analysis.client_name);
+        console.log(`[AMO] Имя контакта #${contactId} обновлено: "${analysis.client_name}"`);
+      } catch (err) {
+        console.error(`[AMO] Ошибка обновления имени контакта:`, err.message);
+      }
+    }
+
+    // ── Step 9: Enrich lead name ─────────────────────────────────────────────
+    if (analysis.client_name && leadId) {
+      try {
+        const newLeadName = `${analysis.client_name} ${phone}`;
+        await updateLeadName(leadId, newLeadName);
+        console.log(`[AMO] Название сделки #${leadId} обновлено: "${newLeadName}"`);
+      } catch (err) {
+        console.error(`[AMO] Ошибка обновления названия сделки:`, err.message);
+      }
+    }
+
+    // ── Step 10: Update lead tags ────────────────────────────────────────────
+    if (analysis.tags.length > 0 && leadId) {
+      try {
+        await updateLeadTags(leadId, analysis.tags);
+        console.log(`[AMO] Теги сделки #${leadId} обновлены: ${analysis.tags.join(', ')}`);
+      } catch (err) {
+        console.error(`[AMO] Ошибка обновления тегов:`, err.message);
+      }
+    }
+
+    // ── Step 11: Create follow-up task ───────────────────────────────────────
+    if (analysis.has_next_step && analysis.next_step_text && leadId) {
+      try {
+        const responsibleUserId = await getResponsibleUserId();
+        if (responsibleUserId) {
+          await createTask(leadId, responsibleUserId, analysis.next_step_text, analysis.next_step_deadline_days);
+          console.log(`[AMO] Задача создана в сделке #${leadId}: "${analysis.next_step_text}" (через ${analysis.next_step_deadline_days} дн.)`);
+        }
+      } catch (err) {
+        console.error(`[AMO] Ошибка создания задачи:`, err.message);
+      }
     }
   } catch (err) {
     console.error(`[WEBHOOK] Необработанная ошибка (callid=${callid}):`, err.message);
   } finally {
-    // ── Step 9: Clean up temp file ───────────────────────────────────────────
+    // ── Cleanup: Delete temp MP3 ─────────────────────────────────────────────
     if (tmpPath) {
       fs.unlink(tmpPath, (err) => {
         if (err) console.warn(`[WEBHOOK] Не удалось удалить temp файл ${tmpPath}:`, err.message);
