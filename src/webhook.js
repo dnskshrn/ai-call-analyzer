@@ -3,7 +3,7 @@ import path from 'path';
 import { pipeline } from 'stream/promises';
 import axios from 'axios';
 import OpenAI from 'openai';
-import { searchByPhone, postNote } from './amocrm.js';
+import { searchByPhone, createContactWithLead, postNote } from './amocrm.js';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
@@ -108,7 +108,7 @@ async function summariseTranscript(transcript) {
  */
 async function postNoteToAmo(amoResult, noteText, phone) {
   if (!amoResult) {
-    console.warn(`[AMO] Контакт не найден для номера ${phone}. Заметка не опубликована.`);
+    console.warn(`[AMO] Нет данных сущности для ${phone} — заметка не опубликована.`);
     return;
   }
 
@@ -176,13 +176,18 @@ export async function handleWebhook(req, res) {
 
     const noteText = buildNoteText(meta, summary);
 
-    // ── Step 6: Search AmoCRM ────────────────────────────────────────────────
+    // ── Step 6: Search AmoCRM, create if not found ──────────────────────────
     console.log(`[AMO] Ищу контакт по номеру: ${phone}`);
     let amoResult = null;
     try {
       amoResult = await searchByPhone(phone);
+
+      if (!amoResult) {
+        console.log(`[AMO] Контакт не найден, создаю новый контакт и сделку для ${phone}`);
+        amoResult = await createContactWithLead(phone);
+      }
     } catch (amoErr) {
-      console.error(`[AMO] Ошибка поиска (callid=${callid}):`, amoErr.message);
+      console.error(`[AMO] Ошибка поиска/создания (callid=${callid}):`, amoErr.message);
     }
 
     // ── Steps 7 & 8: Post note ───────────────────────────────────────────────

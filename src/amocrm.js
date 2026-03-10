@@ -94,6 +94,53 @@ export async function searchByPhone(phone) {
 }
 
 /**
+ * Create a new contact + lead in AmoCRM and link them together.
+ * Used when searchByPhone() returns null.
+ *
+ * @param {string} phone
+ * @returns {Promise<{contactId: number, leadId: number, entityType: 'leads'}>}
+ */
+export async function createContactWithLead(phone) {
+  // 1. Create contact
+  const { data: contactData } = await amoClient.post('/contacts', [
+    {
+      name: `Звонок ${phone}`,
+      custom_fields_values: [
+        {
+          field_id: 264,
+          values: [{ value: phone, enum_code: 'WORK' }],
+        },
+      ],
+    },
+  ]);
+
+  const contactId = contactData._embedded.contacts[0].id;
+  console.log(`[AMO] Создан контакт #${contactId}`);
+
+  // 2. Create lead
+  const { data: leadData } = await amoClient.post('/leads', [
+    {
+      name: `Входящий звонок ${phone}`,
+    },
+  ]);
+
+  const leadId = leadData._embedded.leads[0].id;
+  console.log(`[AMO] Создана сделка #${leadId}`);
+
+  // 3. Link contact to lead
+  await amoClient.post(`/leads/${leadId}/links`, [
+    {
+      to_entity_id: contactId,
+      to_entity_type: 'contacts',
+    },
+  ]);
+
+  console.log(`[AMO] Контакт #${contactId} привязан к сделке #${leadId}`);
+
+  return { contactId, leadId, entityType: 'leads' };
+}
+
+/**
  * Post a common note to a lead or contact in AmoCRM.
  *
  * @param {'leads'|'contacts'} entityType
